@@ -1,8 +1,17 @@
 package main
 
 import (
+	"time"
+
 	"github.com/gin-gonic/gin"
 )
+
+type Recipes struct {
+	Name         string    `json:"name"`
+	Ingredients  []string  `json:"ingredients"`
+	Instructions []string  `json:"instruction"`
+	PublishedAt  time.Time `json:"publishedAt"`
+}
 
 func main() {
 	r := gin.Default()
