@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -10,6 +11,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/xid"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
 type Recipes struct {
@@ -26,7 +30,6 @@ var recipes []Recipes
 func init() {
 	recipes = make([]Recipes, 0)
 	file, err := os.ReadFile("recipes.json")
-
 	if err != nil {
 		log.Fatal("Error while reading the file ", err)
 	}
@@ -36,6 +39,24 @@ func init() {
 	if err != nil {
 		log.Fatal("Cannot unmarshal the file ", err)
 	}
+
+	ctx := context.Background()
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URI")))
+	if err = client.Ping(context.TODO(), readpref.Primary()); err != nil {
+		log.Fatal(err)
+	}
+	log.Println("Connect to mongo db server")
+
+	var listOfRecipes []interface{}
+	for _, recipe := range recipes {
+		listOfRecipes = append(listOfRecipes, recipe)
+	}
+	collection := client.Database(os.Getenv("MONGO_DATABASE")).Collection("recipes")
+	insertManyResult, err := collection.InsertMany(ctx, listOfRecipes)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("Inserted recipes: ", len(insertManyResult.InsertedIDs))
 }
 
 func NewRecpiesHandler(c *gin.Context) {
