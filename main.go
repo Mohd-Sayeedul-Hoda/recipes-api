@@ -2,61 +2,42 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/rs/xid"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
 type Recipes struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Tags         []string  `json:"tags"`
-	Ingredients  []string  `json:"ingredients"`
-	Instructions []string  `json:"instruction"`
-	PublishedAt  time.Time `json:"publishedAt"`
+	ID           primitive.ObjectID `json:"id" bson:"_id"`
+	Name         string             `json:"name" bson:"name"`
+	Tags         []string           `json:"tags" bson:"tags"`
+	Ingredients  []string           `json:"ingredients" bson:"ingredients"`
+	Instructions []string           `json:"instruction" bson:"instruction"`
+	PublishedAt  time.Time          `json:"publishedAt" bson:"publishedAt"`
 }
 
-var recipes []Recipes
+var ctx context.Context
+var err error
+var client *mongo.Client
+var collection *mongo.Collection
 
 func init() {
-	recipes = make([]Recipes, 0)
-	file, err := os.ReadFile("recipes.json")
-	if err != nil {
-		log.Fatal("Error while reading the file ", err)
-	}
-
-	err = json.Unmarshal([]byte(file), &recipes)
-
-	if err != nil {
-		log.Fatal("Cannot unmarshal the file ", err)
-	}
-
-	ctx := context.Background()
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URI")))
+	ctx = context.Background()
+	client, err = mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URI")))
 	if err = client.Ping(context.TODO(), readpref.Primary()); err != nil {
 		log.Fatal(err)
 	}
+	collection = client.Database(os.Getenv("MONGO_DATABASE")).Collection("recipes")
 	log.Println("Connect to mongo db server")
-
-	var listOfRecipes []interface{}
-	for _, recipe := range recipes {
-		listOfRecipes = append(listOfRecipes, recipe)
-	}
-	collection := client.Database(os.Getenv("MONGO_DATABASE")).Collection("recipes")
-	insertManyResult, err := collection.InsertMany(ctx, listOfRecipes)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Inserted recipes: ", len(insertManyResult.InsertedIDs))
 }
 
 func NewRecpiesHandler(c *gin.Context) {
@@ -69,13 +50,34 @@ func NewRecpiesHandler(c *gin.Context) {
 		return
 	}
 
-	recipe.ID = xid.New().String()
+	recipe.ID = primitive.NewObjectID()
 	recipe.PublishedAt = time.Now()
-	recipes = append(recipes, recipe)
+
+	_, err = collection.InsertOne(ctx, recipe)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Error while inserting the a new recipes",
+		})
+		return
+	}
 	c.JSON(http.StatusOK, recipe)
 }
 
 func ListRecipiesHandler(c *gin.Context) {
+	cur, err := collection.Find(ctx, bson.M{})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	defer cur.Close(ctx)
+	recipes := make([]Recipes, 0)
+	for cur.Next(ctx) {
+		var recipe Recipes
+		cur.Decode(&recipe)
+		recipes = append(recipes, recipe)
+	}
 	c.JSON(http.StatusOK, recipes)
 }
 
@@ -86,42 +88,48 @@ func UpdateRecipeHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": err.Error(),
 		})
+		return
 	}
-	index := -1
-	for i := 0; i < len(recipes); i++ {
-		if id == recipes[i].ID {
-			index = i
-			break
-		}
-	}
-	if index == -1 {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": "Recipe not found",
+	objectId, _ := primitive.ObjectIDFromHex(id)
+	_, err = collection.UpdateOne(ctx, bson.M{
+		"_id": objectId,
+	}, bson.D{{"$set", bson.D{
+		{"name", recipe.Name},
+		{"instructions", recipe.Instructions},
+		{"ingredients", recipe.Ingredients},
+		{"tags", recipe.Tags},
+	}}})
+	if err != nil {
+		fmt.Println(err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
 		})
 		return
 	}
-
-	recipes[index] = recipe
-	c.JSON(http.StatusOK, recipe)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Recipe has been updated",
+	})
 }
 
 func DeleteRecipeHandler(c *gin.Context) {
 	id := c.Param("id")
-	index := -1
-	for i := 0; i < len(recipes); i++ {
-		if id == recipes[i].ID {
-			index = i
-			break
-		}
+	objectId, _ := primitive.ObjectIDFromHex(id)
+	deleteResult, err := collection.DeleteOne(ctx, bson.M{
+		"_id": objectId,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "error while deleting the recipes",
+		})
+		log.Println("error while deleteing ", err.Error())
 	}
-	if index == -1 {
+
+	if deleteResult.DeletedCount == 0 {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error": "Recipe Not Found",
 		})
 		return
 	}
-
-	recipes = append(recipes[:index], recipes[index+1:]...)
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Recipe Deleted",
 	})
@@ -130,21 +138,45 @@ func DeleteRecipeHandler(c *gin.Context) {
 func SearchRecipeHandler(c *gin.Context) {
 	tags := c.Query("tags")
 	listOfRecipes := make([]Recipes, 0)
-
-	for i := 0; i < len(recipes); i++ {
-		for _, t := range recipes[i].Tags {
-			if strings.EqualFold(tags, t) {
-				listOfRecipes = append(listOfRecipes, recipes[i])
-			}
-		}
+	cur, err := collection.Find(ctx, bson.M{
+		"tags": tags,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Internal server error while searching for tag",
+		})
+		log.Println("Cannot find the tag ", err.Error())
 	}
+
+	for cur.Next(ctx) {
+		var recipe Recipes
+		cur.Decode(&recipe)
+		listOfRecipes = append(listOfRecipes, recipe)
+	}
+
 	c.JSON(http.StatusOK, listOfRecipes)
+}
+
+func GetOneRecipeHandler(c *gin.Context) {
+	id := c.Param("id")
+	objectId, _ := primitive.ObjectIDFromHex(id)
+	cur := collection.FindOne(ctx, bson.M{
+		"_id": objectId,
+	})
+	var recipe Recipes
+	err := cur.Decode(&recipe)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, recipe)
 }
 
 func main() {
 	r := gin.Default()
 	r.POST("/recipes", NewRecpiesHandler)
 	r.GET("/recipes", ListRecipiesHandler)
+	r.GET("/recipes/:id", GetOneRecipeHandler)
 	r.PUT("/recipes/:id", UpdateRecipeHandler)
 	r.DELETE("/recipes/:id", DeleteRecipeHandler)
 	r.GET("/recipes/search", SearchRecipeHandler)
